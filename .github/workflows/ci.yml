@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — Laravel 12
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: foodonthego_testing
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: pdo_mysql, redis, mbstring, intl, zip, bcmath
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Code style (Pint)
+        run: vendor/bin/pint --test
+
+      # NOTE: PHP static analysis is deliberately absent — see docs/13-known-issues.md
+      # (KI-003). Add `vendor/bin/phpstan analyse` here once PHPStan is installable.
+
+      - name: Migrate
+        run: php artisan migrate --force
+        env:
+          DB_HOST: 127.0.0.1
+          DB_DATABASE: foodonthego_testing
+          DB_USERNAME: root
+          DB_PASSWORD: root
+
+      - name: Test
+        run: php artisan test
+        env:
+          DB_HOST: 127.0.0.1
+          DB_DATABASE: foodonthego_testing
+          DB_USERNAME: root
+          DB_PASSWORD: root
+          REDIS_HOST: 127.0.0.1
+
+      - name: Audit dependencies
+        run: composer audit --abandoned=ignore
+
+  web:
+    name: Web — React + TypeScript
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build restaurant dashboard
+        run: npm run build --workspace @fotg/restaurant
+
+      - name: Build admin panel
+        run: npm run build --workspace @fotg/admin
+
+      # Fails on high or critical only. Moderate advisories are reported, not fatal.
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+  mobile:
+    name: Mobile — Flutter
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.2'
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Verify formatting
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze
+        run: flutter analyze --fatal-infos
+
+      - name: Test
+        run: flutter test
+
+      # Requires the Android SDK. Blocked in the Module 01 build environment
+      # (docs/13-known-issues.md KI-001); expected to pass on a standard runner.
+      - name: Build Android (debug)
+        run: flutter build apk --debug
+
+  ios:
+    name: Mobile — iOS build
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: mobile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.2'
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      # No code signing in CI: this validates that the iOS target compiles.
+      # Simulator UI testing is tracked separately (KI-002).
+      - name: Build iOS (no codesign)
+        run: flutter build ios --no-codesign --debug
